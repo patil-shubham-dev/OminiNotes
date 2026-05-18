@@ -16,6 +16,8 @@ except ImportError:
     OPENAI_AVAILABLE = False
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
+OPENAI_BASE_URL = os.getenv("OPENAI_BASE_URL", os.getenv("OPENAI_API_BASE", ""))
+
 
 
 def format_notes_with_ai(raw_text: str, style: str = "structured", api_config: Optional[Dict] = None) -> Dict:
@@ -42,24 +44,148 @@ def format_notes_with_ai(raw_text: str, style: str = "structured", api_config: O
     return format_with_rules(raw_text, style)
 
 
+def call_anthropic_api(raw_text: str, style: str, config: Dict) -> Dict:
+    """Use Anthropic API to format notes using urllib.request"""
+    import urllib.request
+    import urllib.error
+    import json
+    
+    api_key = config.get("api_key")
+    if not api_key:
+        raise ValueError("No Anthropic API key provided")
+        
+    model = config.get("model") or "claude-3-5-sonnet-latest"
+    
+    system_prompt = """You are OmniNotes AI, an expert note-taking assistant. 
+Your task is to convert messy OCR text into beautifully structured notes.
+
+Rules:
+- Identify headings, subheadings, bullet points, and numbered lists
+- Format equations using LaTeX-style notation ($...$)
+- Preserve all important information
+- Remove OCR artifacts and fix obvious errors
+- Organize content logically with clear hierarchy
+- Use markdown formatting
+
+Output a JSON object with these fields:
+- formatted_text: The main structured notes in markdown
+- summary: A brief 2-3 sentence summary
+- key_points: Array of 3-7 key takeaways
+- flashcards: Array of objects with "question" and "answer" (only if style is "flashcards")
+- quiz_questions: Array of objects with "question", "options" (array), "correct_answer" (index) (only if style is "quiz")
+"""
+
+    style_instructions = {
+        "structured": "Create well-structured notes with clear headings and bullet points.",
+        "summary": "Focus on creating a comprehensive summary with key points.",
+        "flashcards": "Create structured notes AND generate 5-10 flashcards for key concepts.",
+        "quiz": "Create structured notes AND generate 5 quiz questions with multiple choice answers."
+    }
+
+    user_prompt = f"""Style: {style_instructions.get(style, style_instructions["structured"])}
+
+Raw OCR text:
+---
+{raw_text}
+---
+
+Please format this into structured notes. Your entire response MUST be a valid JSON object. Do not wrap it in markdown code blocks."""
+
+    headers = {
+        "x-api-key": api_key,
+        "anthropic-version": "2023-06-01",
+        "content-type": "application/json"
+    }
+    
+    payload = {
+        "model": model,
+        "max_tokens": 4000,
+        "system": system_prompt,
+        "messages": [
+            {"role": "user", "content": user_prompt}
+        ],
+        "temperature": 0.3
+    }
+    
+    data = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(
+        "https://api.anthropic.com/v1/messages",
+        data=data,
+        headers=headers,
+        method="POST"
+    )
+    
+    try:
+        with urllib.request.urlopen(req, timeout=30) as response:
+            resp_data = json.loads(response.read().decode("utf-8"))
+            raw_content = resp_data["content"][0]["text"].strip()
+    except urllib.error.HTTPError as e:
+        error_content = e.read().decode("utf-8")
+        print(f"Anthropic API Error: {error_content}")
+        raise ValueError(f"Anthropic API error: {e.code} - {error_content}")
+    except Exception as e:
+        print(f"Anthropic Request Error: {e}")
+        raise e
+
+    # Strip markdown code blocks if the model wrapped the JSON
+    if raw_content.startswith("```json"):
+        raw_content = raw_content[7:]
+    elif raw_content.startswith("```"):
+        raw_content = raw_content[3:]
+    if raw_content.endswith("```"):
+        raw_content = raw_content[:-3]
+    raw_content = raw_content.strip()
+
+    try:
+        result = json.loads(raw_content)
+    except Exception as e:
+        print(f"Failed to parse JSON: {raw_content[:200]}... Error: {e}")
+        result = {"formatted_text": raw_content}
+
+    return {
+        "formatted_text": result.get("formatted_text", raw_text),
+        "summary": result.get("summary", ""),
+        "key_points": result.get("key_points", []),
+        "flashcards": result.get("flashcards", []),
+        "quiz_questions": result.get("quiz_questions", [])
+    }
+
+
 def format_with_ai_provider(raw_text: str, style: str, api_config: Optional[Dict]) -> Dict:
     """Use configured AI provider to format notes"""
     # Merge provided config with defaults
+    provider = api_config.get("provider", "openai") if api_config else "openai"
+    
     config = {
-        "api_key": OPENAI_API_KEY,
-        "base_url": None,
+        "api_key": OPENAI_API_KEY if provider == "openai" else None,
+        "base_url": OPENAI_BASE_URL if provider == "openai" else None,
         "model": "gpt-4o-mini",
-        "provider": "openai"
+        "provider": provider
     }
     if api_config:
         config.update({k: v for k, v in api_config.items() if v})
+
+    # If Anthropic provider
+    if provider == "anthropic":
+        return call_anthropic_api(raw_text, style, config)
+
+    # Configure defaults for standard OpenAI-compatible providers
+    if provider == "openrouter":
+        config["base_url"] = config.get("base_url") or "https://openrouter.ai/api/v1"
+        config["model"] = config.get("model") or "google/gemini-2.5-flash"
+    elif provider == "nvidia":
+        config["base_url"] = config.get("base_url") or "https://integrate.api.nvidia.com/v1"
+        config["model"] = config.get("model") or "meta/llama-3.1-8b-instruct"
+    elif provider == "openai":
+        config["base_url"] = config.get("base_url") or "https://api.openai.com/v1"
+        config["model"] = config.get("model") or "gpt-4o-mini"
 
     if not config["api_key"] and not config["base_url"]:
         raise ValueError("No API key or base URL provided")
 
     client = openai.OpenAI(
-        api_key=config["api_key"],
-        base_url=config["base_url"]
+        api_key=config["api_key"] or "dummy-key",
+        base_url=config["base_url"] or None
     )
 
     system_prompt = """You are OmniNotes AI, an expert note-taking assistant. 
@@ -97,18 +223,46 @@ Raw OCR text:
 
 Please format this into structured notes."""
 
-    response = client.chat.completions.create(
-        model=config["model"],
-        messages=[
+    kwargs = {
+        "model": config["model"],
+        "messages": [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_prompt}
         ],
-        response_format={"type": "json_object"},
-        temperature=0.3,
-        max_tokens=4000
-    )
+        "temperature": 0.3,
+        "max_tokens": 4000
+    }
 
-    result = json.loads(response.choices[0].message.content)
+    # Some OpenAI-compatible APIs (like Nvidia/OpenRouter) do not support response_format
+    if provider == "openai":
+        kwargs["response_format"] = {"type": "json_object"}
+
+    try:
+        response = client.chat.completions.create(**kwargs)
+    except Exception as e:
+        if "response_format" in kwargs:
+            print(f"Retrying without response_format due to error: {e}")
+            del kwargs["response_format"]
+            response = client.chat.completions.create(**kwargs)
+        else:
+            raise e
+
+    raw_content = response.choices[0].message.content.strip()
+    
+    # Strip markdown code blocks if the model wrapped the JSON
+    if raw_content.startswith("```json"):
+        raw_content = raw_content[7:]
+    elif raw_content.startswith("```"):
+        raw_content = raw_content[3:]
+    if raw_content.endswith("```"):
+        raw_content = raw_content[:-3]
+    raw_content = raw_content.strip()
+
+    try:
+        result = json.loads(raw_content)
+    except Exception as e:
+        print(f"Failed to parse JSON: {raw_content[:200]}... Error: {e}")
+        result = {"formatted_text": raw_content}
 
     # Ensure all fields exist
     return {
@@ -120,22 +274,107 @@ Please format this into structured notes."""
     }
 
 
+def refine_text_with_anthropic(original_text: str, selection: str, instruction: str, config: Dict) -> str:
+    """Refine a selection of text using Anthropic Claude"""
+    import urllib.request
+    import json
+    
+    api_key = config.get("api_key")
+    if not api_key:
+        return selection
+        
+    model = config.get("model") or "claude-3-5-sonnet-latest"
+    
+    system_prompt = """You are OmniNotes AI, an expert note-taking assistant.
+The user wants to refine a specific section of their notes.
+Original Context: The full document content is provided for context.
+Selection: The specific part the user wants to change.
+Instruction: What to do with the selection.
+
+Rules:
+- ONLY output the refined version of the selection.
+- Do not include explanations, prefixes, or suffixes.
+- Maintain the style of the rest of the document.
+- If the instruction is "remove", return an empty string or a minimal placeholder.
+"""
+
+    user_prompt = f"""Context:
+{original_text}
+
+Selection to refine:
+{selection}
+
+Instruction:
+{instruction}
+
+Refined version:"""
+
+    headers = {
+        "x-api-key": api_key,
+        "anthropic-version": "2023-06-01",
+        "content-type": "application/json"
+    }
+    
+    payload = {
+        "model": model,
+        "max_tokens": 2000,
+        "system": system_prompt,
+        "messages": [
+            {"role": "user", "content": user_prompt}
+        ],
+        "temperature": 0.7
+    }
+    
+    data = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(
+        "https://api.anthropic.com/v1/messages",
+        data=data,
+        headers=headers,
+        method="POST"
+    )
+    
+    try:
+        with urllib.request.urlopen(req, timeout=30) as response:
+            resp_data = json.loads(response.read().decode("utf-8"))
+            return resp_data["content"][0]["text"].strip()
+    except Exception as e:
+        print(f"Anthropic refine error: {e}")
+        return selection
+
+
 def refine_text_with_ai(original_text: str, selection: str, instruction: str, api_config: Optional[Dict] = None) -> str:
     """Refine a specific part of the text based on user instruction"""
+    provider = api_config.get("provider", "openai") if api_config else "openai"
+    
     config = {
-        "api_key": OPENAI_API_KEY,
-        "base_url": None,
-        "model": "gpt-4o-mini"
+        "api_key": OPENAI_API_KEY if provider == "openai" else None,
+        "base_url": OPENAI_BASE_URL if provider == "openai" else None,
+        "model": "gpt-4o-mini",
+        "provider": provider
     }
     if api_config:
         config.update({k: v for k, v in api_config.items() if v})
+
+    if provider == "anthropic":
+        return refine_text_with_anthropic(original_text, selection, instruction, config)
+
+    # OpenAI-compatible setup
+    if provider == "openrouter":
+        config["base_url"] = config.get("base_url") or "https://openrouter.ai/api/v1"
+        config["model"] = config.get("model") or "google/gemini-2.5-flash"
+    elif provider == "nvidia":
+        config["base_url"] = config.get("base_url") or "https://integrate.api.nvidia.com/v1"
+        config["model"] = config.get("model") or "meta/llama-3.1-8b-instruct"
+    elif provider == "openai":
+        config["base_url"] = config.get("base_url") or "https://api.openai.com/v1"
+        config["model"] = config.get("model") or "gpt-4o-mini"
 
     if not config["api_key"] and not config["base_url"]:
         return selection # Fallback to no change
 
     client = openai.OpenAI(
         api_key=config["api_key"],
-        base_url=config["base_url"]
+        base_url=config["base_url"] or None
     )
 
     system_prompt = """You are OmniNotes AI, an expert note-taking assistant.
@@ -180,25 +419,88 @@ Refined version:"""
 
 def test_ai_connection(api_config: Dict) -> Dict:
     """Test the connection to an AI provider"""
+    provider = api_config.get("provider", "openai") if api_config else "openai"
+    
     config = {
-        "api_key": OPENAI_API_KEY,
-        "base_url": None,
+        "api_key": OPENAI_API_KEY if provider == "openai" else None,
+        "base_url": OPENAI_BASE_URL if provider == "openai" else None,
         "model": "gpt-4o-mini",
-        "provider": "openai"
+        "provider": provider
     }
     config.update({k: v for k, v in api_config.items() if v})
+
+    # If Anthropic provider
+    if provider == "anthropic":
+        import urllib.request
+        import json
+        
+        api_key = config.get("api_key")
+        if not api_key:
+            return {"status": "error", "message": "No Anthropic API key provided"}
+            
+        model = config.get("model") or "claude-3-5-sonnet-latest"
+        
+        headers = {
+            "x-api-key": api_key,
+            "anthropic-version": "2023-06-01",
+            "content-type": "application/json"
+        }
+        
+        payload = {
+            "model": model,
+            "max_tokens": 10,
+            "messages": [
+                {"role": "user", "content": "Say 'hello'"}
+            ],
+            "temperature": 0
+        }
+        
+        data = json.dumps(payload).encode("utf-8")
+        req = urllib.request.Request(
+            "https://api.anthropic.com/v1/messages",
+            data=data,
+            headers=headers,
+            method="POST"
+        )
+        
+        try:
+            with urllib.request.urlopen(req, timeout=15) as response:
+                resp_data = json.loads(response.read().decode("utf-8"))
+                if resp_data.get("content"):
+                    return {"status": "success", "message": "Connection successful!"}
+                return {"status": "error", "message": "No response content from Anthropic"}
+        except urllib.error.HTTPError as e:
+            try:
+                error_msg = e.read().decode("utf-8")
+                error_data = json.loads(error_msg)
+                error_detail = error_data.get("error", {}).get("message", "API Key verification failed")
+            except Exception:
+                error_detail = f"HTTP Error {e.code}"
+            return {"status": "error", "message": f"Connection failed: {error_detail}"}
+        except Exception as e:
+            return {"status": "error", "message": f"Connection failed: {str(e)[:100]}"}
+
+    # Configure defaults for OpenAI-compatible providers
+    if provider == "openrouter":
+        config["base_url"] = config.get("base_url") or "https://openrouter.ai/api/v1"
+        config["model"] = config.get("model") or "google/gemini-2.5-flash"
+    elif provider == "nvidia":
+        config["base_url"] = config.get("base_url") or "https://integrate.api.nvidia.com/v1"
+        config["model"] = config.get("model") or "meta/llama-3.1-8b-instruct"
+    elif provider == "openai":
+        config["base_url"] = config.get("base_url") or "https://api.openai.com/v1"
+        config["model"] = config.get("model") or "gpt-4o-mini"
 
     if not config["api_key"] and not config["base_url"]:
         return {"status": "error", "message": "No API key or base URL provided"}
 
     try:
         client = openai.OpenAI(
-            api_key=config["api_key"],
+            api_key=config["api_key"] or "dummy-key",
             base_url=config["base_url"] or None
         )
         
         # Simple completion request to test connection
-        # Using only a user message for maximum compatibility across providers
         response = client.chat.completions.create(
             model=config["model"],
             messages=[
@@ -214,7 +516,6 @@ def test_ai_connection(api_config: Dict) -> Dict:
         
     except Exception as e:
         error_msg = str(e)
-        # Clean up common error messages
         if "401" in error_msg:
             error_msg = "Invalid API Key (Unauthorized)"
         elif "404" in error_msg:
@@ -222,7 +523,7 @@ def test_ai_connection(api_config: Dict) -> Dict:
         elif "Connection error" in error_msg:
             error_msg = "Could not reach the server. Check your Base URL and internet."
             
-        return {"status": "error", "message": f"Connection failed: {error_msg}"}
+        return {"status": "error", "message": f"Connection failed: {error_msg[:120]}"}
 
 
 def format_with_rules(raw_text: str, style: str) -> Dict:
